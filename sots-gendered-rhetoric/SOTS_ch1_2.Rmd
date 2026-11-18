@@ -1,0 +1,1488 @@
+---
+title: "State of the State Addresses: What Governors Talk About (Ch. 1) and How They Talk About It (Ch. 2)"
+subtitle: "Structural topic model + Roberts & Utych (2020) gendered language dictionary"
+date: ""
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 300, fig.align = "center"
+)
+
+# All paths are relative to the project root (the folder holding this file).
+# Knit from that folder, or open sots-gendered-rhetoric.Rproj in RStudio.
+```
+
+# Overview
+
+This document reproduces the analysis for two dissertation chapters on U.S. governors' State of the State addresses, 1924 to the present. See `README.md` for how to get the data and run it.
+
+**Dissertation structure**
+
+| Chapter | Data | Question | Method |
+|---|---|---|---|
+| 1 | State of the State addresses | **What** do governors talk about? | Structural topic model (STM) with governor gender, party, and year as prevalence covariates |
+| 2 | State of the State addresses | **How** do governors talk about those topics? | Roberts & Utych gendered-language dictionary, scored speech-wide *and* within topic |
+| 3 | Persuade vs. explain open-ends | Can we predict author gender from language? | (separate project) |
+
+**Pipeline in this file**
+
+1. Load metadata + speech text (1924 onward, Democrats and Republicans only).
+2. Code governor gender.
+3. Clean the text once (`clean_text()`), used by both the dictionary and the STM.
+4. **Ch. 2 measure:** score every speech with the Roberts & Utych dictionary.
+5. **Ch. 1:** fit the STM; estimate how topic prevalence differs by gender and party.
+6. **Ch. 2:** split speeches into ~250-word passages, assign each passage its topic using the Ch. 1 model, and compare how men and women talk *within the same topic*.
+
+**Sign convention used everywhere:** `fem_score` > 0 = feminine-coded language, < 0 = masculine-coded language, 0 = the neutral midpoint of the Roberts & Utych scale.
+
+# Setup
+
+```{r packages}
+library(readr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(forcats)
+library(tidytext)      # tokenizing
+library(stm)           # topic model (also needs tm + SnowballC installed)
+library(ggplot2)
+library(scales)
+library(ggrepel)       # non-overlapping labels
+library(broom)
+library(sandwich)      # clustered standard errors
+library(lmtest)
+library(modelsummary)  # regression tables
+library(igraph)
+# tm / NLP (loaded by stm's textProcessor) have their own annotate(), which
+# hides ggplot2's and causes "unused arguments (xmin = ...)". Make ggplot2's win.
+annotate <- ggplot2::annotate
+```
+
+## Parameters
+
+All analysis choices are set here in one place.
+
+```{r params}
+min_year        <- 1924   # keep speeches from this year onward
+min_tokens      <- 300    # drop fragments shorter than this (10 speeches)
+K               <- 50     # number of STM topics (see searchK chunk to justify)
+chunk_size      <- 250    # words per passage for the within-topic analysis (Ch. 2)
+min_topic_share <- 0.30   # a passage counts as "about" topic k only if theta_k >= this
+min_dict_words  <- 5      # minimum dictionary hits for a speech-by-topic cell
+n_common_drop   <- 25     # robustness: drop the N most frequent dictionary words
+refit_stm       <- FALSE  # TRUE re-estimates the STM; FALSE loads the saved model
+seed            <- 20260427
+
+dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/models",  recursive = TRUE, showWarnings = FALSE)
+```
+
+## Plot theme and palettes
+
+One theme and one set of colors for every figure, so the dissertation figures look like a set. Colors were checked for colorblind separation and contrast.
+
+* **Party:** Democrats blue, Republicans red.
+* **Language direction:** feminine-coded teal, masculine-coded amber (deliberately *not* blue, so it never collides with Democrats).
+* **Governor gender:** women violet, men a neutral gray reference.
+
+```{r theme}
+pal_party  <- c(Democratic = "#2E5EAA", Republican = "#C0392B")
+pal_gender <- c(Male = "#6B7280", Female = "#7A4FBF")
+pal_lang   <- c(`Feminine-coded` = "#1E8C6E", `Masculine-coded` = "#B8650F",
+                `Not distinguishable from 0` = "#A3A3A3")
+
+theme_diss <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title            = element_text(face = "bold", size = rel(1.15), margin = margin(b = 4)),
+      plot.subtitle         = element_text(color = "grey30", margin = margin(b = 12)),
+      plot.caption          = element_text(color = "grey45", size = rel(0.75), hjust = 0,
+                                           margin = margin(t = 10)),
+      plot.title.position   = "plot",
+      plot.caption.position = "plot",
+      panel.grid.minor      = element_blank(),
+      panel.grid.major      = element_line(color = "grey91", linewidth = 0.3),
+      axis.title            = element_text(color = "grey25", size = rel(0.9)),
+      axis.text             = element_text(color = "grey35"),
+      strip.text            = element_text(face = "bold", hjust = 0, size = rel(0.95),
+                                           margin = margin(b = 6)),
+      legend.position       = "top",
+      legend.justification  = "left",
+      legend.title          = element_text(size = rel(0.85), color = "grey25"),
+      plot.margin           = margin(12, 16, 12, 12)
+    )
+}
+theme_set(theme_diss())
+
+# shared zero line for the gendered-language scale
+zero_line <- geom_hline(yintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4)
+
+# save every figure as png (slides/poster) + pdf (dissertation)
+save_fig <- function(plot, name, width = 8, height = 5) {
+  ggsave(file.path("output/figures", paste0(name, ".png")), plot, width = width, height = height, dpi = 300, bg = "white")
+  ggsave(file.path("output/figures", paste0(name, ".pdf")), plot, width = width, height = height, device = cairo_pdf)
+  invisible(plot)
+}
+```
+
+# Part 1: Data
+
+## Metadata and speech text
+
+* An `inner_join()` keeps exactly the speeches that are in the filtered metadata *and* have text.
+* Party is restricted to Democrats and Republicans (30 Independent / 6 Alaskan Independence speeches dropped) before anything is scored.
+
+```{r load-data}
+meta <- read_csv("data/sots_data/sots_metadata.csv", show_col_types = FALSE) |>
+  select(-starts_with("aws_path")) |>
+  filter(year >= min_year, party %in% c("Democratic", "Republican"))
+
+raw_files <- list.files("data/sots_data/raw", pattern = "\\.txt$", full.names = TRUE)
+
+speech_text <- tibble(
+  id   = tools::file_path_sans_ext(basename(raw_files)),
+  text = map_chr(raw_files, \(f) read_file(f, locale = locale(encoding = "UTF-8")))
+)
+
+sots <- inner_join(meta, speech_text, by = "id")
+
+# Illinois House session transcripts (1980-1994) where roll calls and bill
+# readings make up more than half the document; identified from an initial STM
+# (procedural topic share > 0.5).
+exclude_ids <- c(
+  "a91362f3f9bd58ad47c90b84b87fb96c", "b33cbcf2c9e9759f89da8bd70517489b",
+  "a6155bbf92872860da2032a698e2bfa7", "90f3cd7f66c02433cff90799073a5786",
+  "069090ab1f8352b17dbe85e66fb35527", "5a09e2de7de5130ff93ed24e54733535",
+  "968775ce1a21bdc165559c4797ce4e4c", "0dd941a6248fcc854dea9b1b9f32ddd5",
+  "c0b843f411f9ba443c7398541c9bcaa9", "9f33f9ca5c871a35b1c27ae2104ec4d0"
+)
+sots <- sots |> filter(!id %in% exclude_ids)
+
+tibble(
+  `metadata rows (filtered)` = nrow(meta),
+  `text files`               = nrow(speech_text),
+  `metadata rows w/o text`   = sum(!meta$id %in% speech_text$id),
+  `speeches kept`            = nrow(sots)
+)
+```
+
+## Governor gender
+
+The metadata has no gender field, so women governors are listed by name. The names are spelled *exactly* as they appear in the metadata, including its misspellings (`Chritine Gregoire`, `Bev Purdue` for Bev Perdue), and the `stopifnot()` stops the script if any name fails to match. A silent mismatch would code a woman as a man.
+
+```{r governor-gender}
+female_governors <- c(
+  "Ann Richards", "Barbara Roberts", "Bev Purdue", "Christine Gregoire", "Chritine Gregoire",
+  "Christine Todd Whitman", "Dixy Lee Ray", "Gina M. Raimondo", "Gina Raimondo", "Gretchen Whitmer",
+  "Jan Brewer", "Jane Dee Hull", "Jane Swift", "Janet Mills", "Janet Napolitano", "Jeanne Shaheen",
+  "Jennifer M. Granholm", "Joan Finney", "Judy Martz", "Kate Brown", "Kathleen Babineaux Blanco",
+  "Kathleen Sebelius", "Kathy Hochul", "Katie Hobbs", "Kay A. Orr", "Kay Ivey", "Kim Reynolds",
+  "Kristi Noem", "Laura Kelly", "Linda Lingle", "M. Jodi Rell", "Madeleine Kunin", "Maggie Hassan",
+  "Martha Layne Collins", "Mary Fallin", "Maura Healey", "Michelle Lujan Grisham", "Miriam A. Ferguson",
+  "Nikki Haley", "Olene S. Walker", "Rose Mofford", "Ruth Ann Minner", "Sarah Huckabee Sanders",
+  "Sarah Palin", "Susana Martinez", "Tina Kotek"
+)
+
+stopifnot("a female governor name does not match the metadata" =
+            all(female_governors %in% sots$governor))
+
+sots <- sots |>
+  mutate(
+    female     = as.integer(governor %in% female_governors),
+    republican = as.integer(party == "Republican"),
+    gender     = factor(if_else(female == 1, "Female", "Male"), levels = c("Male", "Female")),
+    party      = factor(party, levels = c("Democratic", "Republican")),
+    group      = factor(paste(gender, party),
+                        levels = c("Male Democratic", "Female Democratic",
+                                   "Male Republican", "Female Republican")),
+    decade     = floor(year / 10) * 10
+  )
+
+count(sots, gender, party)
+```
+
+## Text cleaning
+
+`clean_text()` makes only whole-word edits. Substring replacement (e.g. `gsub("can", "", text)`) is avoided on purpose: it matches *inside* words, turning *American* into *Ameri* and breaking *money*, *statement*, and dictionary words such as *man* and *woman*.
+
+* normalizes curly quotes and removes bracketed stage directions (`[Applause]`, `[Video clip ...]`);
+* rejoins words hyphenated across line breaks (`gov-\nernment`);
+* inserts the missing space in run-together sentences (`ago.Mr.`); without it the tokenizer reads `ago.mr` as one word and both words are lost;
+* removes state names and demonyms as whole words, including two-word names like *New York*.
+
+Generic and procedural words (*will*, *year*, *speaker*...) are removed later as STM stopwords. They are not removed from the dictionary text, because the dictionary only ever looks at its own 700 words.
+
+```{r clean-text}
+demonyms <- c(
+  "alabamian", "alabaman", "alaskan", "arizonan", "arizonian", "arkansan", "californian", "coloradan",
+  "coloradoan", "connecticuter", "delawarean", "floridian", "georgian", "hawaiian", "idahoan",
+  "illinoisan", "hoosier", "indianan", "iowan", "kansan", "kentuckian", "louisianan", "louisianian",
+  "mainer", "marylander", "bay stater", "michigander", "michiganian", "minnesotan", "mississippian",
+  "missourian", "montanan", "nebraskan", "nevadan", "new hampshirite", "new jerseyan", "new mexican",
+  "new yorker", "north carolinian", "north dakotan", "ohioan", "oklahoman", "oregonian",
+  "pennsylvanian", "rhode islander", "south carolinian", "south dakotan", "tennessean", "texan",
+  "utahn", "utahan", "vermonter", "virginian", "washingtonian", "west virginian", "wisconsinite",
+  "wyomingite"
+)
+place_words <- c(tolower(state.name), demonyms)
+# longest first so "west virginia" is removed before "virginia"
+place_rx <- paste0("\\b(", paste(place_words[order(-nchar(place_words))], collapse = "|"), ")s?\\b")
+
+clean_text <- function(x) {
+  x |>
+    str_replace_all("[\u2018\u2019\u02bc`]", "'") |>
+    str_replace_all("[\u201c\u201d]", '"') |>
+    str_remove_all("\ufeff") |>
+    str_replace_all("\\[[^\\]]{0,300}\\]", " ") |>
+    str_replace_all("(\\w)-\\s*\\n\\s*(\\w)", "\\1\\2") |>
+    str_replace_all("([.!?;:,])(?=[A-Za-z])", "\\1 ") |>
+    str_replace_all(regex("\\((applause|laughter|cheers|cheering|clapping|standing ovation|inaudible|crosstalk)[^)]{0,40}\\)",
+                          ignore_case = TRUE), " ") |>      # (Applause), (Laughter) ...
+    str_replace_all("[-\u2013\u2014]", " ") |>             # hyphens/dashes -> space ("hb-", "-th")
+    str_squish() |>
+    str_to_lower() |>
+    str_replace_all(place_rx, " ")
+}
+
+sots <- sots |> mutate(text_clean = clean_text(text))
+```
+
+# Part 2: Scoring speeches with the Roberts & Utych dictionary
+
+## The dictionary and the score
+
+In the R&U data, respondents rated each word on a 1–7 scale where **low = feminine and high = masculine** (*woman* = 1.36, *man* = 6.40). The columns are:
+
+* `mean-a`: the average rating across **all** respondents, i.e. how gendered the word is;
+* `mean-m` / `mean--f`: the average rating among male / female **respondents**.
+
+The score uses `mean-a`, the rating across all respondents. The difference `mean--f − mean-m` would measure *how much women and men disagree about a word*, not how masculine or feminine the word is; across the 700 words it correlates only 0.16 with `mean-a`.
+
+Word score: **`fem_score = 4 − mean-a`**. The scale midpoint (4) becomes 0, and positive = feminine.
+
+Dictionary cleaning:
+
+* `str_squish()`: six entries had trailing spaces (*hope*, *dog*, *crush*, *charismatic*, *honesty*, *supporter*), so they could never match. *hope* alone appears about 6,500 times in these speeches.
+* Spelling fixes for typos in the source file (*acheivement*, *resilent*, *triump*, *agreement\*\**, ...), so they match the speeches.
+* Hyphenated and two-word entries (*self-assured*, *consensus building*) are joined with `_` in both the dictionary and the text, so they match as single tokens.
+* *brevity* has no ratings and is dropped.
+
+```{r dictionary}
+spell_fix <- c(
+  "acheivement" = "achievement", "agreement**" = "agreement", "contanimated" = "contaminated",
+  "genuis" = "genius", "poisionous" = "poisonous", "resilent" = "resilient", "triump" = "triumph",
+  "twikle" = "twinkle", "presitge" = "prestige", "self-imporjtant" = "self-important",
+  "perservering" = "persevering", "tempermental" = "temperamental"
+)
+
+ru_dic <- read_excel("data/RobertsUtytch2020data/RobertsUtytch_GenderedLanguage.xlsx") |>
+  transmute(
+    word   = str_squish(str_to_lower(Word)),
+    mean_a = `mean-a`
+  ) |>
+  mutate(word = recode(word, !!!spell_fix)) |>
+  filter(!is.na(word), !is.na(mean_a)) |>
+  mutate(
+    word      = str_replace_all(word, "[- ]", "_"),
+    fem_score = 4 - mean_a                      # + feminine, - masculine
+  )
+
+stopifnot(!anyDuplicated(ru_dic$word))
+
+# join multi-word dictionary entries in the text so they become one token
+compound    <- ru_dic$word[str_detect(ru_dic$word, "_")]
+compound_rx <- setNames(compound, paste0("\\b", str_replace_all(compound, "_", "[- ]"), "\\b"))
+sots <- sots |> mutate(text_dict = str_replace_all(text_clean, compound_rx))
+
+# the most masculine and feminine words in the dictionary, as a sanity check
+bind_rows(slice_min(ru_dic, fem_score, n = 5), slice_max(ru_dic, fem_score, n = 5))
+```
+
+## Tokenize and score
+
+Three speech-level measures:
+
+* **`fem_score`** (main DV): the average `fem_score` of all dictionary words in the speech.
+* **`fem_score_nocommon`** (robustness): the same, dropping the `r n_common_drop` most frequent dictionary words in the corpus. A handful of everyday words (*year*, *people*, *new*, *government*, *work*) make up a large share of all matches; see the figure below.
+* **`fem_share`** (robustness): of the clearly gendered words (rated below 3.5 or above 4.5), the share that are feminine.
+
+```{r score-speeches}
+tokens <- sots |>
+  select(id, text_dict) |>
+  unnest_tokens(word, text_dict) |>
+  filter(!str_detect(word, "^[0-9.,]+$"))
+
+word_freq <- tokens |>
+  inner_join(ru_dic, by = "word") |>
+  count(word, fem_score, sort = TRUE, name = "n") |>
+  mutate(share = n / sum(n))
+
+common_words <- head(word_freq$word, n_common_drop)
+
+doc_scores <- tokens |>
+  group_by(id) |>
+  mutate(n_tokens = n()) |>
+  inner_join(ru_dic, by = "word") |>
+  summarize(
+    n_tokens           = first(n_tokens),
+    n_dict             = n(),
+    # careful: summarize() works top to bottom, so the speech average that
+    # overwrites the word-level `fem_score` has to be computed LAST
+    fem_score_nocommon = mean(fem_score[!word %in% common_words]),
+    fem_share          = sum(fem_score > 0.5) / sum(abs(fem_score) > 0.5),
+    fem_score          = mean(fem_score),
+    .groups = "drop"
+  ) |>
+  mutate(dict_coverage = n_dict / n_tokens)
+
+speeches <- sots |>
+  select(-text, -text_dict) |>
+  inner_join(doc_scores, by = "id") |>
+  filter(n_tokens >= min_tokens)
+
+summary(select(speeches, n_tokens, n_dict, dict_coverage, fem_score, fem_score_nocommon, fem_share))
+```
+
+On average about `r percent(mean(speeches$dict_coverage), 0.1)` of the words in a speech are in the dictionary (a median of `r median(speeches$n_dict)` dictionary words per speech).
+
+## Which words drive the score?
+
+Read this before interpreting anything else. If a handful of very common words carry most of the score, differences between governors can reflect *how often they say "people" or "government"* rather than gendered rhetoric. That is why the robustness measures exist.
+
+```{r fig-dictionary-words, fig.height=6.5}
+# dissertation: Ch. 2 results
+# shows what the measure is made of
+top_words <- word_freq |>
+  slice_head(n = 25) |>
+  mutate(
+    direction = if_else(fem_score > 0, "Feminine-coded", "Masculine-coded"),
+    word      = fct_reorder(word, share)
+  )
+
+p_words <- ggplot(top_words, aes(x = share, y = word, color = direction)) +
+  geom_segment(aes(x = 0, xend = share, yend = word), linewidth = 0.8) +
+  geom_point(size = 2.6) +
+  geom_text(aes(label = sprintf("%+.2f", fem_score)), hjust = -0.35, size = 3,
+            color = "grey35", show.legend = FALSE) +
+  scale_color_manual(values = pal_lang, name = NULL) +
+  scale_x_continuous(labels = label_percent(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "A few everyday words account for much of the dictionary signal",
+    subtitle = sprintf("The %d most frequent dictionary words make up %s of all dictionary matches",
+                       nrow(top_words), percent(sum(top_words$share), 1)),
+    x = "Share of all dictionary matches in the corpus", y = NULL,
+    caption  = "Numbers show each word's score (4 - mean rating): positive = feminine-coded, negative = masculine-coded."
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+save_fig(p_words, "ch2_fig01_dictionary_top_words", height = 6.5)
+```
+
+## Gendered language by governor gender and party
+
+Every speech as a point, with a box for the middle 50% and a black dot for the group mean. This replaces the bar chart of means, which hid how much the speeches vary within each group.
+
+```{r fig-group-distribution, fig.height=5.5}
+# zoom the y-axis to the bulk of the data but keep the 0 reference line in view
+# dissertation: Ch. 2 results
+# descriptive: all groups look alike 
+y_zoom <- c(quantile(speeches$fem_score, 0.001), max(0.02, quantile(speeches$fem_score, 0.999)))
+
+group_means <- speeches |>
+  group_by(group, party) |>
+  summarize(mean = mean(fem_score), n = n(), .groups = "drop")
+
+p_groups <- ggplot(speeches, aes(x = group, y = fem_score, color = party)) +
+  zero_line +
+  geom_point(position = position_jitter(width = 0.18, height = 0, seed = seed), alpha = 0.22, size = 0.9) +
+  geom_boxplot(width = 0.32, fill = NA, outlier.shape = NA, linewidth = 0.5, color = "grey20") +
+  geom_point(data = group_means, aes(y = mean), color = "black", size = 2.8) +
+  scale_color_manual(values = pal_party, guide = "none") +
+  scale_x_discrete(labels = setNames(
+    paste0(str_replace(group_means$group, " ", "\n"), "\n(n = ", comma(group_means$n), ")"),
+    group_means$group)) +
+  # zoom without dropping data (a handful of extreme speeches would flatten the boxes)
+  coord_cartesian(ylim = y_zoom) +
+  labs(
+    title    = "Gendered language in State of the State addresses",
+    subtitle = "Average gender rating of the dictionary words in each speech",
+    x = NULL, y = "Gendered language score\n(< 0 masculine, > 0 feminine)",
+    caption  = "Each point is one speech. Black dot = group mean; box = middle 50%."
+  ) +
+  theme(panel.grid.major.x = element_blank())
+
+save_fig(p_groups, "ch2_fig02_group_distribution", height = 5.5)
+```
+
+## Change over time
+
+Women's speeches are concentrated after 1980, so any raw gender gap is partly a *time* gap. This plot shows the secular trend that the regressions control for with year fixed effects.
+
+```{r fig-time-trend, fig.height=5}
+# dissertation: Ch. 2 appendix
+# shows the era confound 
+p_time <- ggplot(speeches, aes(x = year, y = fem_score, color = gender)) +
+  zero_line +
+  geom_point(data = filter(speeches, female == 0), alpha = 0.18, size = 0.8) +
+  geom_point(data = filter(speeches, female == 1), alpha = 0.75, size = 1.5) +
+  geom_smooth(data = filter(speeches, female == 0), method = "loess", span = 0.4,
+              se = TRUE, linewidth = 0.9, fill = "grey80") +
+  scale_color_manual(values = pal_gender, name = "Governor",
+                     labels = c(Male = "Men", Female = "Women")) +
+  scale_x_continuous(breaks = seq(1930, 2020, 10)) +
+  coord_cartesian(ylim = y_zoom) +
+  guides(color = guide_legend(override.aes = list(fill = NA, alpha = 1))) +
+  labs(
+    title    = "Gendered language over time",
+    subtitle = "Gray line = smoothed average for men; violet points = speeches by women",
+    x = NULL, y = "Gendered language score\n(< 0 masculine, > 0 feminine)"
+  )
+
+p_time
+
+save_fig(p_time, "ch2_fig03_time_trend")
+```
+
+## Regression: gender, party, and gendered language
+
+The reference group is set on purpose by coding `female` and `republican` as 0/1, so **male Democrats are the reference** and:
+
+* `female` = female − male gap **among Democrats**;
+* `republican` = Republican − Democratic gap **among men**;
+* `female × republican` = how much the gender gap differs for Republicans.
+
+(To choose a different reference group with a factor, use `relevel()`, e.g. `mutate(group = relevel(group, ref = "Male Republican"))`.)
+
+Standard errors are **clustered by governor**, because the same governor gives several speeches, so the speeches are not independent. The year and state fixed effects (Model 4) compare governors in the same year and the same state.
+
+```{r regressions}
+# all of these regressions need to go in the results section of ch2 
+# shows speech level gaps plus robustness measures 
+m1 <- lm(fem_score ~ female, data = speeches)
+m2 <- lm(fem_score ~ female + republican, data = speeches)
+m3 <- lm(fem_score ~ female * republican, data = speeches)
+m4 <- lm(fem_score ~ female * republican + factor(year) + state, data = speeches)
+m5 <- lm(fem_score_nocommon ~ female * republican + factor(year) + state, data = speeches)
+m6 <- lm(fem_share ~ female * republican + factor(year) + state, data = speeches)
+
+models <- list("(1)" = m1, "(2)" = m2, "(3)" = m3, "(4) Year + state FE" = m4,
+               "(5) Drop common words" = m5, "(6) Feminine share" = m6)
+
+modelsummary(
+  models,
+  vcov      = ~governor,
+  coef_map  = c(female = "Female governor", republican = "Republican",
+                `female:republican` = "Female x Republican", `(Intercept)` = "Intercept"),
+  gof_map   = c("nobs", "r.squared"),
+  stars     = TRUE,
+  add_rows  = data.frame(term = c("Year FE", "State FE"),
+                         m1 = "", m2 = "", m3 = "", m4 = "Yes", m5 = "Yes", m6 = "Yes"),
+  notes     = "Standard errors clustered by governor. Models 1-5: average dictionary score (+ = feminine). Model 6: share of gendered words that are feminine."
+)
+```
+
+### Estimated gaps
+
+The regression coefficients turned into the four comparisons of interest, with clustered 95% CIs. All three outcomes are standardized (SD units), so they sit on one axis.
+
+```{r fig-gaps, fig.height=4.8}
+# linear combination of coefficients with a clustered vcov
+
+# dissertation: Ch. 2 results
+# same results, visual, in SD units 
+lincom <- function(model, w) {
+  V <- vcovCL(model, cluster = ~governor)
+  b <- coef(model)[rownames(V)]
+  g <- setNames(rep(0, length(b)), names(b))
+  g[names(w)] <- w
+  tibble(estimate = sum(g * b), std.error = sqrt(as.numeric(t(g) %*% V %*% g)))
+}
+
+gap_contrasts <- list(
+  "Women vs. men\n(Democrats)"          = c(female = 1),
+  "Women vs. men\n(Republicans)"        = c(female = 1, `female:republican` = 1),
+  "Republicans vs. Democrats\n(men)"    = c(republican = 1),
+  "Republicans vs. Democrats\n(women)"  = c(republican = 1, `female:republican` = 1)
+)
+
+outcomes <- c(fem_score = "Average score (main)",
+              fem_score_nocommon = "Drop common words",
+              fem_share = "Feminine share")
+
+gaps <- imap_dfr(outcomes, \(label, dv) {
+  d <- speeches |> mutate(y = as.numeric(scale(.data[[dv]])))
+  m <- lm(y ~ female * republican + factor(year) + state, data = d)
+  imap_dfr(gap_contrasts, \(w, nm) lincom(m, w) |> mutate(contrast = nm))  |>
+    mutate(outcome = label)
+}) |>
+  mutate(
+    contrast = factor(contrast, levels = rev(names(gap_contrasts))),
+    outcome  = factor(outcome, levels = outcomes),
+    lo = estimate - 1.96 * std.error, hi = estimate + 1.96 * std.error
+  )
+
+p_gaps <- ggplot(gaps, aes(x = estimate, y = contrast, shape = outcome)) +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, fill = pal_lang[["Feminine-coded"]], alpha = 0.05) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = -Inf, ymax = Inf, fill = pal_lang[["Masculine-coded"]], alpha = 0.05) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.6),
+                  size = 0.45, linewidth = 0.6, color = "grey15", fill = "white") +
+  scale_shape_manual(values = c(16, 21, 17), name = NULL) +
+  labs(
+    title    = "Gender and party gaps in gendered language",
+    subtitle = "Difference in standardized gendered-language score, with year and state fixed effects",
+    x = "Difference (SD units)\n<-- more masculine-coded  |  more feminine-coded -->", y = NULL,
+    caption  = "Points = estimates; lines = 95% CIs clustered by governor."
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+p_gaps
+
+save_fig(p_gaps, "ch2_fig04_gender_party_gaps", height = 4.8)
+```
+
+## Which words differ between women and men?
+
+The score is an average, so this plot opens it up: which dictionary words do women governors use more (right) or less (left) than men, per 10,000 words? It is restricted to **1975 onward**, where nearly all of the women's speeches are, so the comparison is between contemporaries.
+
+```{r fig-word-differences, fig.height=7}
+# dissertation: Ch. 2 appendix
+# general word-level results 
+modern_ids <- speeches |> filter(year >= 1975) |> select(id, gender)
+
+word_rates <- tokens |>
+  inner_join(modern_ids, by = "id") |>
+  group_by(gender) |>
+  mutate(total = n()) |>
+  inner_join(ru_dic, by = "word") |>
+  count(gender, word, fem_score, total) |>
+  mutate(rate = n / total * 1e4) |>
+  select(-n, -total) |>
+  pivot_wider(names_from = gender, values_from = rate, values_fill = 0) |>
+  mutate(diff = Female - Male)
+
+word_diff <- bind_rows(slice_max(word_rates, diff, n = 12), slice_min(word_rates, diff, n = 12)) |>
+  mutate(direction = if_else(fem_score > 0, "Feminine-coded", "Masculine-coded"),
+         word = fct_reorder(word, diff))
+
+p_wordiff <- ggplot(word_diff, aes(x = diff, y = word, fill = direction)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.4) +
+  scale_fill_manual(values = pal_lang, name = "Word is") +
+  labs(
+    title    = "Dictionary words women and men governors use at different rates",
+    subtitle = "State of the State addresses, 1975 onward",
+    x = "Difference in uses per 10,000 words\n<-- used more by men  |  used more by women -->",
+    y = NULL
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+p_wordiff
+
+save_fig(p_wordiff, "ch2_fig05_word_differences", height = 7)
+```
+
+# Part 3 (Chapter 1): What governors talk about
+
+## Prepare documents
+
+`textProcessor()` lowercases, removes punctuation, numbers, and standard stopwords, and stems. On top of that it removes procedural and generic words through `customstopwords`; these are whole-word matches. `prepDocuments(lower.thresh = 10)` drops words used in fewer than 10 speeches, which removes OCR noise and speeds up the model a lot.
+
+```{r stm-prep}
+sots_stopwords <- c(
+  "state", "states", "year", "years", "will", "one", "can", "get", "also", "must", "shall", "upon",
+  "may", "make", "made", "need", "now", "just", "know", "want", "think", "say", "said", "thing",
+  "things", "like", "well", "today", "governor", "legislature", "legislative", "session", "assembly",
+  "general", "members", "member", "speaker", "president", "senator", "senators", "representative",
+  "representatives", "ladies", "gentlemen", "mr", "mrs", "lieutenant", "address", "thank", "dont",
+  "weve", "ive", "lets", "let", "going", "got", "talk", "jan", "january", 
+  # contractions as textProcessor sees them (apostrophe already stripped)
+  gsub("'", "", grep("'", tm::stopwords("en"), value = TRUE)),
+  "gonna", "yall", "okay", "ok", "thats", "theres", "therell", "applause",
+  "laughter", "clap", "cheers", "your", "really", "lot", "guess"
+)
+
+stm_meta <- speeches |> select(id, year, decade, state, governor, party, gender, group, female, republican)
+
+processed <- textProcessor(
+  documents       = speeches$text_clean,
+  metadata        = stm_meta,
+  customstopwords = sots_stopwords,
+  verbose         = FALSE
+)
+
+out <- prepDocuments(processed$documents, processed$vocab, processed$meta, lower.thresh = 10)
+```
+
+## Choosing K (run once, not on every knit)
+
+`searchK()` gives the diagnostics (held-out likelihood, semantic coherence, exclusivity) used to choose K = 50. It took about an hour on 4 cores, so the saved results are loaded; the original call is kept in the chunk.
+
+```{r searchK}
+# searchK took about an hour (4 cores), so it was run once and saved.
+# The original call, kept for the record:
+# k_search <- searchK(out$documents, out$vocab, K = c(10, 20, 30, 40, 50, 60, 70),
+#                     prevalence = ~ female * republican + s(year),
+#                     data = out$meta, init.type = "Spectral", seed = seed, cores = 4)
+# saveRDS(k_search, "output/models/searchK.rds")
+
+# load the saved results instead of rerunning
+k_search <- readRDS("output/models/searchK.rds")
+
+plot(k_search)
+```
+
+## Fit the STM
+
+Gender, party, and year enter as **prevalence covariates**, so the model itself estimates whether women/men and Democrats/Republicans give different amounts of attention to each topic. That is exactly the Ch. 1 question. `init.type = "Spectral"` is deterministic, and the model is saved so the topic numbers do not change between knits.
+
+> **Note:** topic numbers are arbitrary and specific to this fitted model. The hand labels below match the saved model in `output/models/stm_model.rds`; if the model is refit, re-read `labelTopics()` and update them.
+
+```{r stm-fit}
+stm_file <- "output/models/stm_model.rds"
+
+if (refit_stm || !file.exists(stm_file)) {
+  stm_model <- stm(
+    documents  = out$documents,
+    vocab      = out$vocab,
+    K          = K,
+    prevalence = ~ female * republican + s(year),
+    data       = out$meta,
+    init.type  = "Spectral",
+    seed       = seed,
+    verbose    = TRUE
+  )
+  saveRDS(stm_model, stm_file)
+} else {
+  stm_model <- readRDS(stm_file)
+}
+```
+
+## Label the topics
+
+```{r label-topics}
+labelTopics(stm_model, n = 8)
+```
+
+Each topic was labeled by reading its top FREX words and its most representative speeches (`findThoughts()`), and classified by type so that procedural and place-specific topics can be set aside in the substantive comparisons.
+
+```{r topic-labels}
+# Hand labels from reading labelTopics() output and representative speeches.
+# type: substantive = policy/rhetoric content; state = place-specific;
+#       procedural = legislative journal text; delivery = speaking style/recognitions;
+#       artifact = archive/OCR text
+topic_info <- tribble(
+  ~topic, ~label,                                   ~type,
+   1, "Natural resources & conservation",           "substantive",
+   2, "Recognitions & guests (WV)",                 "delivery",
+   3, "Joint session procedure",                    "procedural",
+   4, "Children & families",                        "substantive",
+   5, "Recognitions & guests (GA)",                 "delivery",
+   6, "Illinois House transcripts",                 "procedural",
+   7, "Early-century governance rhetoric",          "substantive",
+   8, "South Dakota (informal)",                    "state",
+   9, "South Dakota",                               "state",
+  10, "Washington: forests & salmon",               "state",
+  11, "Roll calls & member names",                  "procedural",
+  12, "Jobs & workforce",                           "substantive",
+  13, "New Jersey (+ archive text)",                "state",
+  14, "Alaska: oil & gas",                          "state",
+  15, "COVID, opioids & health care",               "substantive",
+  16, "Tennessee legislative journal",              "procedural",
+  17, "Libraries & archive text",                   "artifact",
+  18, "Crime & criminal justice",                   "substantive",
+  19, "Vision & shared values",                     "substantive",
+  20, "Water & pollution",                          "substantive",
+  21, "Wisconsin senate journal",                   "procedural",
+  22, "State finance & banking",                    "substantive",
+  23, "Mental health & state institutions",         "substantive",
+  24, "Pennsylvania",                               "state",
+  25, "K-12 education",                             "substantive",
+  26, "New York",                                   "state",
+  27, "Energy",                                     "substantive",
+  28, "Conversational delivery",                    "delivery",
+  29, "New Mexico senate journal",                  "procedural",
+  30, "Commissions & reorganization",               "substantive",
+  31, "Western water, irrigation & mining",         "substantive",
+  32, "Health & human services programs",          "substantive",
+  33, "Delaware (+ OCR fragments)",                 "state",
+  34, "Commonwealth states (VA/KY/MA)",             "state",
+  35, "Government goals & environment (1970s)",     "substantive",
+  36, "Budget & appropriations",                    "substantive",
+  37, "Industry, trade & research",                 "substantive",
+  38, "Public works & public health (early)",       "substantive",
+  39, "Agriculture & rural development",            "substantive",
+  40, "Digitization notes (archive)",               "artifact",
+  41, "Taxes & property tax relief",                "substantive",
+  42, "Wyoming: coal & minerals",                   "state",
+  43, "Hawaii",                                     "state",
+  44, "Crime & welfare reform (1990s)",             "substantive",
+  45, "Dollar amounts (spelled out)",               "delivery",
+  46, "Budget cuts, deficits & Medicaid",           "substantive",
+  47, "Legislative journals (CA/FL)",               "procedural",
+  48, "War, veterans & postwar",                    "substantive",
+  49, "Prisons, pardons & segregation era",         "substantive",
+  50, "Texas & Missouri",                           "state"
+)
+stopifnot(nrow(topic_info) == K, all(topic_info$topic == 1:K))
+
+topic_labels       <- sprintf("T%02d: %s", topic_info$topic, topic_info$label)
+substantive_topics <- topic_info$topic[topic_info$type == "substantive"]
+
+# how many topics of each type
+count(topic_info, type)
+
+# to check a label, read the 2 most representative speeches for a topic, e.g. topic 19:
+# findThoughts(stm_model, texts = speeches$text[match(out$meta$id, speeches$id)], topics = 19, n = 2)
+```
+
+## Topic prevalence
+
+Speech-level topic proportions (theta), joined back to the speech data. Each row sums to 1.
+
+```{r theta}
+theta <- as_tibble(stm_model$theta, .name_repair = \(x) sprintf("topic_%02d", seq_along(x))) |>
+  mutate(id = out$meta$id)
+
+speeches_topics <- inner_join(speeches, theta, by = "id")
+
+topic_prev <- tibble(
+  topic      = 1:K,
+  label      = topic_labels,
+  prevalence = colMeans(stm_model$theta)
+)
+```
+
+
+```{r fig-topic-prevalence, fig.height=8.5}
+# dissertation: Ch. 1 results
+topic_prev <- topic_prev |>
+  select(topic, label, prevalence) |>
+  left_join(select(topic_info, topic, type), by = "topic")
+
+p_prev <- topic_prev |>
+  filter(type == "substantive") |>
+  mutate(label = fct_reorder(label, prevalence)) |>
+  ggplot(aes(x = prevalence, y = label)) +
+  geom_col(width = 0.7, fill = "#2E5EAA") +
+  geom_text(aes(label = percent(prevalence, 0.1)), hjust = -0.15, size = 3, color = "grey30") +
+  scale_x_continuous(labels = label_percent(accuracy = 1), expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "What governors talk about",
+    subtitle = sprintf("Substantive topics in State of the State addresses, %d-%d",
+                       min(speeches$year), max(speeches$year)),
+    x = "Expected share of a speech", y = NULL,
+    caption  = sprintf("%d of %d topics shown. State-specific, procedural, delivery, and archive topics are omitted (see appendix).",
+                       length(substantive_topics), K)
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+p_prev
+
+save_fig(p_prev, "ch1_fig01_topic_prevalence", height = 8.5)
+```
+
+## Do women and men (and the parties) talk about different things?
+
+`estimateEffect()` regresses each topic's proportion on the covariates while carrying over the model's uncertainty about theta. The coefficient on `female` is the difference in **percentage points of a speech** devoted to the topic, holding party and year constant.
+
+```{r estimate-effect}
+# Regress each topic's proportion on governor gender and party.
+# s(year) = flexible time trend; state = state fixed effects, so the gender
+# effect compares governors within the same state. Without it, state-specific
+# topics (e.g., "Washington: forests & salmon") would show a "gender effect"
+# just because a woman governed that state.
+set.seed(seed)  # estimateEffect() simulates from theta; fix the draws
+eff <- estimateEffect(1:K ~ female + republican + s(year) + state, stm_model,
+                      metadata = out$meta, uncertainty = "Global")
+
+tidy_effect <- function(eff, term) {
+  s <- summary(eff)
+  map2_dfr(s$topics, s$tables, \(k, tab) tibble(
+    topic = k, term = term,
+    estimate = tab[term, "Estimate"], std.error = tab[term, "Std. Error"]
+  )) |>
+    mutate(lo = estimate - 1.96 * std.error, hi = estimate + 1.96 * std.error,
+           label = topic_labels[topic])
+}
+
+topic_effects <- bind_rows(tidy_effect(eff, "female"), tidy_effect(eff, "republican")) |>
+  left_join(select(topic_info, topic, type), by = "topic")
+```
+
+
+```{r fig-topic-gender, fig.height=8}
+# dissertation: Ch. 1 results
+# the core result: there is almost NO gender differences 
+plot_topic_effect <- function(df, pos_label, neg_label, pos_color, neg_color, title, subtitle) {
+  df |>
+    filter(type == "substantive") |>
+    mutate(
+      sig   = case_when(lo > 0 ~ pos_label, hi < 0 ~ neg_label, TRUE ~ "No clear difference"),
+      sig   = factor(sig, levels = c(pos_label, neg_label, "No clear difference")),
+      label = fct_reorder(label, estimate)
+    ) |>
+    ggplot(aes(x = estimate * 100, y = label, color = sig)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_pointrange(aes(xmin = lo * 100, xmax = hi * 100), size = 0.35, linewidth = 0.6,
+                   show.legend = TRUE) +
+    scale_color_manual(values = setNames(c(pos_color, neg_color, "#B5B5B5"),
+                                         c(pos_label, neg_label, "No clear difference")),
+                       name = NULL, drop = FALSE) +
+    labs(title = title, subtitle = subtitle,
+         x = "Difference in share of speech (percentage points)", y = NULL,
+         caption = "Substantive topics only. estimateEffect() with party (or gender), a year spline, and state fixed effects; 95% intervals.") +
+    theme(panel.grid.major.y = element_blank())
+}
+
+p_topic_gender <- plot_topic_effect(
+  filter(topic_effects, term == "female"),
+  pos_label = "Women more", neg_label = "Men more",
+  pos_color = pal_gender[["Female"]], neg_color = "grey25",
+  title    = "Topic attention: women vs. men governors",
+  subtitle = "Female - male difference in expected topic proportion, within states"
+)
+
+p_topic_gender
+
+save_fig(p_topic_gender, "ch1_fig02_topic_gender", height = 8)
+```
+
+
+```{r fig-topic-party, fig.height=8}
+# dissertation: Ch. 1 results
+# party differences are larger than gender differences 
+p_topic_party <- plot_topic_effect(
+  filter(topic_effects, term == "republican"),
+  pos_label = "Republicans more", neg_label = "Democrats more",
+  pos_color = pal_party[["Republican"]], neg_color = pal_party[["Democratic"]],
+  title    = "Topic attention: Republican vs. Democratic governors",
+  subtitle = "Republican - Democratic difference in expected topic proportion, within states"
+)
+
+p_topic_party
+
+save_fig(p_topic_party, "ch1_fig03_topic_party", height = 8)
+```
+
+## Topics over time
+
+The six topics with the largest gender differences, smoothed over time. This shows whether "women talk more about X" just reflects X rising in the years women held office.
+
+```{r fig-topic-time, fig.height=6.5}
+# dissertation: Ch. 1 appendix
+# its contextually useful, but not a finding
+top_gender_topics <- topic_effects |>
+  filter(term == "female", type == "substantive") |>
+  slice_max(abs(estimate), n = 6) |>
+  pull(topic)
+
+p_topic_time <- speeches_topics |>
+  select(year, all_of(sprintf("topic_%02d", top_gender_topics))) |>
+  pivot_longer(-year, names_to = "topic", values_to = "theta") |>
+  mutate(topic = topic_labels[as.integer(str_remove(topic, "topic_"))]) |>
+  ggplot(aes(x = year, y = theta)) +
+  geom_point(alpha = 0.08, size = 0.5, color = "grey40") +
+  geom_smooth(method = "loess", span = 0.4, color = "#2E5EAA", fill = "#2E5EAA",
+              alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~topic, ncol = 2, scales = "free_y") +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(title    = "Topic Attention Over Time",
+       subtitle = "Six substantive topics with the largest female - male differences",
+       x = NULL, y = "Share of speech")
+
+p_topic_time
+
+save_fig(p_topic_time, "ch1_fig04_topics_over_time", height = 6.5)
+```
+
+## Which topics appear together?
+
+`topicCorr()` correlates topic proportions across speeches. A positive correlation means two topics tend to show up in the same speeches. The heatmap shows the substantive topics, ordered so that topics that co-occur sit next to each other (hierarchical clustering).
+
+```{r topic-correlations, fig.height=8, fig.width=10}
+# dissertation: Ch. 1 results
+# this shows how the sots is orangized 
+tc <- topicCorr(stm_model, method = "simple")
+
+# --- edges: pairs of substantive topics that co-occur more than this ---
+edge_cutoff <- 0.05      # raise to show fewer, stronger links; lower to show more
+cm  <- tc$cor[substantive_topics, substantive_topics]
+idx <- which(upper.tri(cm) & cm > edge_cutoff, arr.ind = TRUE)
+edges <- tibble(from = substantive_topics[idx[, 1]],
+                to   = substantive_topics[idx[, 2]],
+                r    = cm[idx])
+
+# --- nodes: one per substantive topic, colored by the Ch. 1 gender result ---
+nodes <- topic_prev |>
+  select(topic, prevalence) |>
+  left_join(select(topic_info, topic, type, short = label), by = "topic") |>
+  filter(type == "substantive") |>
+  left_join(topic_effects |> filter(term == "female") |> select(topic, lo, hi), by = "topic") |>
+  mutate(gender_diff = case_when(lo > 0 ~ "Women more", hi < 0 ~ "Men more",
+                                 TRUE ~ "No clear difference"),
+         gender_diff = factor(gender_diff, levels = c("Women more", "Men more", "No clear difference")))
+
+# --- layout: topics that co-occur are pulled together ---
+g <- igraph::graph_from_data_frame(
+  mutate(edges, from = as.character(from), to = as.character(to)),
+  directed = FALSE,
+  vertices = tibble(name = as.character(nodes$topic))
+)
+set.seed(seed)
+lay <- igraph::layout_with_fr(g, weights = igraph::E(g)$r)
+pos <- tibble(topic = as.integer(igraph::V(g)$name), x = lay[, 1], y = lay[, 2])
+
+nodes   <- left_join(nodes, pos, by = "topic")
+edge_xy <- edges |>
+  left_join(pos, by = c("from" = "topic")) |>
+  left_join(rename(pos, xend = x, yend = y), by = c("to" = "topic"))
+
+p_corr <- ggplot() +
+  geom_segment(data = edge_xy, aes(x = x, y = y, xend = xend, yend = yend, linewidth = r),
+               color = "grey78", lineend = "round") +
+  geom_point(data = nodes, aes(x = x, y = y, size = prevalence, fill = gender_diff),
+             shape = 21, color = "white", stroke = 0.8) +
+  ggrepel::geom_text_repel(data = nodes, aes(x = x, y = y, label = short),
+                           size = 3.2, color = "grey20", seed = seed,
+                           box.padding = 0.5, max.overlaps = Inf, min.segment.length = 0.3) +
+  scale_linewidth(range = c(0.3, 2.5), guide = "none") +
+  scale_size(range = c(3, 12), labels = label_percent(accuracy = 1),
+             name = "Average share of speech") +
+  scale_fill_manual(values = c("Women more"          = pal_gender[["Female"]],
+                               "Men more"            = "grey25",
+                               "No clear difference" = "#BDBDBD"),
+                    name = "Gender difference in attention", drop = FALSE) +
+  guides(fill = guide_legend(override.aes = list(size = 5), order = 1),
+         size = guide_legend(order = 2)) +
+  labs(
+    title    = "Which topics appear in the same speeches?",
+    subtitle = "Lines connect substantive topics that tend to co-occur; thicker lines = stronger co-occurrence",
+    caption  = sprintf("topicCorr(method = 'simple'); links shown for correlations above %.2f. Circle size = average share of a speech.\nColor = Chapter 1 gender difference in attention (estimateEffect, 95%% intervals). Topics with no links sit at the edges.",
+                       edge_cutoff)
+  ) +
+  theme(axis.text = element_blank(), axis.title = element_blank(),
+        panel.grid = element_blank(), legend.position = "bottom", legend.box = "vertical")
+
+p_corr
+
+save_fig(p_corr, "ch1_fig05_topic_correlations", width = 10, height = 8)
+
+# the 10 strongest links, for the text
+edges |>
+  mutate(from = topic_labels[from], to = topic_labels[to]) |>
+  slice_max(r, n = 10)
+```
+
+## Do women differ from men within each party?
+
+The main model assumes the gender difference is the same in both parties. Here gender is interacted with party, and the female - male difference is computed separately **among Democrats** and **among Republicans**. The model also includes the year spline and state fixed effects.
+
+```{r gender-party-interaction}
+set.seed(seed)
+eff_int <- estimateEffect(1:K ~ female * republican + s(year) + state, stm_model,
+                          metadata = out$meta, uncertainty = "Global")
+
+# female - male difference within a party = a combination of coefficients.
+# estimateEffect stores simulated coefficient draws, so the combination is
+# computed draw by draw (the same way summary.estimateEffect() works).
+gap_within_party <- function(eff, weights, nsim = 500) {
+  map_dfr(seq_along(eff$topics), \(i) {
+    draws <- do.call(rbind, lapply(eff$parameters[[i]],
+                                   \(p) MASS::mvrnorm(nsim, p$est, p$vcov)))
+    combo <- as.vector(draws[, names(weights), drop = FALSE] %*% weights)
+    tibble(topic = eff$topics[i], estimate = mean(combo), std.error = sd(combo))
+  }) |>
+    mutate(lo = estimate - 1.96 * std.error, hi = estimate + 1.96 * std.error)
+}
+
+party_gaps <- bind_rows(
+  gap_within_party(eff_int, c(female = 1)) |>
+    mutate(party = "Democrats"),
+  gap_within_party(eff_int, c(female = 1, `female:republican` = 1)) |>
+    mutate(party = "Republicans")
+) |>
+  left_join(select(topic_info, topic, type), by = "topic") |>
+  filter(type == "substantive") |>
+  mutate(label = topic_labels[topic])
+
+# does the gender gap differ by party? (the interaction term itself)
+tidy_effect(eff_int, "female:republican") |>
+  left_join(select(topic_info, topic, type), by = "topic") |>
+  filter(type == "substantive", lo > 0 | hi < 0)
+```
+
+```{r fig-gender-by-party, fig.height=4.5, fig.width=9}
+# dissertation: Ch. 1 results
+# women v men topic attention 
+n_show <- 6
+
+# the topics with the largest female - male gap in either party
+focus_topics <- party_gaps |>
+  group_by(topic) |>
+  summarize(biggest = max(abs(estimate))) |>
+  slice_max(biggest, n = n_show) |>
+  pull(topic)
+
+plot_df <- party_gaps |>
+  filter(topic %in% focus_topics) |>
+  mutate(
+    short = topic_info$label[topic],
+    short = fct_reorder(short, abs(estimate), .fun = max),
+    sig   = if_else(lo > 0 | hi < 0, "Clear difference", "No clear difference")
+  )
+
+p_gender_party <- ggplot(plot_df, aes(x = estimate * 100, y = short, color = party)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+  geom_linerange(aes(xmin = lo * 100, xmax = hi * 100), linewidth = 0.7) +
+  geom_point(aes(shape = sig), size = 2.8, fill = "white", stroke = 1) +
+  facet_wrap(~party, labeller = as_labeller(c(Democrats   = "Women vs. men among Democrats",
+                                              Republicans = "Women vs. men among Republicans"))) +
+  scale_color_manual(values = c(Democrats = pal_party[["Democratic"]],
+                                Republicans = pal_party[["Republican"]]),
+                     guide = "none") +
+  scale_shape_manual(values = c("Clear difference" = 16, "No clear difference" = 21),
+                     name = NULL) +
+  labs(
+    title    = "Only Democratic women differ, and only on jobs",
+    subtitle = sprintf("Female - male difference in topic attention for the %d topics with the largest gaps", n_show),
+    x = "Difference in share of speech (percentage points)\n<-- men more  |  women more -->",
+    y = NULL,
+    caption  = "Filled point = 95% interval excludes 0. All other substantive topics show no clear difference in either party (see appendix).\nestimateEffect() with female x republican, a year spline, and state fixed effects."
+  ) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2, "lines"))
+
+p_gender_party
+save_fig(p_gender_party, "ch1_fig06_gender_by_party", width = 9, height = 4.5)
+```
+
+# Part 4 (Chapter 2): How governors talk about each topic
+
+## Why measure within topic?
+
+A natural first approach is to regress each **speech's** gendered-language score on its topic proportions (`lm(score ~ V1 + ... + V10)`). That has two problems:
+
+1. **Compositional predictors.** Topic proportions sum to 1, so one topic is always dropped and every coefficient means "relative to that topic". If only some topics are entered, the reference becomes the sum of all the others.
+2. **It does not measure "how they talk about a topic."** A speech that is 30% economics and 70% other things gets one score, so you cannot tell whether the masculine words came from the economics part or the rest of the speech.
+
+**Design.** Each speech is cut into consecutive ~`r chunk_size`-word **passages**. The Ch. 1 STM (same vocabulary, same topics) infers each passage's topic proportions with `fitNewDocuments()`. A passage is assigned to topic *k* when theta_k ≥ `r min_topic_share`. The dictionary words in all of a speech's topic-*k* passages are then pooled into a **speech × topic score**: how *this governor* talked about *this topic* in *this speech*. Women and men can then be compared **within the same topic**, which is the Ch. 2 question. It also ties Ch. 1 and Ch. 2 together, because both chapters use one topic model.
+
+## Split speeches into passages
+
+```{r passages}
+passage_tokens <- tokens |>
+  semi_join(speeches, by = "id") |>
+  group_by(id) |>
+  mutate(passage = (row_number() - 1) %/% chunk_size + 1) |>
+  group_by(id, passage) |>
+  filter(n() >= 50) |>                        # drop very short trailing fragments
+  ungroup() |>
+  mutate(passage_id = paste(id, passage, sep = "_"))
+
+passages <- passage_tokens |>
+  group_by(passage_id, id) |>
+  summarize(text = paste(word, collapse = " "), .groups = "drop")
+
+passage_scores <- passage_tokens |>
+  inner_join(ru_dic, by = "word") |>
+  group_by(passage_id) |>
+  summarize(score_sum = sum(fem_score), n_dict = n(), .groups = "drop")
+
+nrow(passages)
+```
+
+## Infer passage topics from the Chapter 1 model
+
+Each passage gets the same `textProcessor()` treatment, then its vocabulary is mapped onto the STM's vocabulary (`alignCorpus()`), and `fitNewDocuments()` estimates its topic proportions with the topic–word distributions held fixed. This is slow with tens of thousands of passages, so the result is cached.
+
+```{r passage-topics}
+passage_theta_file <- "output/models/passage_theta.rds"
+
+if (refit_stm || !file.exists(passage_theta_file)) {
+  p_processed <- textProcessor(
+    documents       = passages$text,
+    metadata        = select(passages, passage_id),
+    customstopwords = sots_stopwords,
+    verbose         = FALSE
+  )
+  p_aligned <- alignCorpus(
+    new       = list(documents = p_processed$documents, vocab = p_processed$vocab,
+                     meta = p_processed$meta),
+    old.vocab = stm_model$vocab
+  )
+  p_fit <- fitNewDocuments(model = stm_model, documents = p_aligned$documents,
+                           prevalencePrior = "Average", verbose = FALSE)
+
+  # alignCorpus() turns a one-column meta data frame into a plain vector when it
+  # drops empty passages, so handle both cases
+  passage_ids <- if (is.data.frame(p_aligned$meta)) p_aligned$meta$passage_id else p_aligned$meta
+  stopifnot(length(passage_ids) == nrow(p_fit$theta))
+
+  passage_theta <- tibble(passage_id = passage_ids) |>
+    mutate(topic       = max.col(p_fit$theta, ties.method = "first"),
+           topic_share = apply(p_fit$theta, 1, max))
+  saveRDS(passage_theta, passage_theta_file)
+} else {
+  passage_theta <- readRDS(passage_theta_file)
+}
+
+# how many passages have a clear dominant topic?
+mean(passage_theta$topic_share >= min_topic_share)
+```
+
+## Speech × topic scores
+
+```{r speech-topic-cells}
+cells <- passage_theta |>
+  filter(topic_share >= min_topic_share) |>
+  inner_join(passage_scores, by = "passage_id") |>
+  inner_join(select(passages, passage_id, id), by = "passage_id") |>
+  group_by(id, topic) |>
+  summarize(score = sum(score_sum) / sum(n_dict), n_dict = sum(n_dict),
+            n_passages = n(), .groups = "drop") |>
+  filter(n_dict >= min_dict_words) |>
+  inner_join(select(speeches, id, year, decade, state, governor, party, gender, group,
+                    female, republican), by = "id") |>
+  mutate(label = topic_labels[topic]) |>
+  left_join(select(topic_info, topic, type), by = "topic")
+
+# substantive topics only, for the Chapter 2 comparisons
+cells_sub <- filter(cells, type == "substantive")
+
+cells_sub |> count(gender, name = "speech_topic_cells")
+```
+
+## How gendered is each topic?
+
+The average tone of each topic's passages (weighted by dictionary hits), shown separately for men and women. Topics are ordered from most masculine-coded (bottom) to most feminine-coded (top). The vertical gray line is the corpus average, since nearly all political language sits on the masculine side of the scale's midpoint. Where the violet and gray dots sit apart, women and men talk about the *same* topic differently.
+
+```{r fig-topic-tone, fig.height=7.5}
+# same inclusion rule as the within-topic gap models, so both figures show the same topics
+
+# dissertation: Ch. 2 results
+# topic matters far more than gender 
+min_female_cells <- 15
+
+topic_tone <- cells_sub |>
+  group_by(topic, label, gender) |>
+  summarize(score = weighted.mean(score, n_dict), n = n(), .groups = "drop") |>
+  group_by(topic) |>
+  filter(sum(n[gender == "Female"]) >= min_female_cells, any(gender == "Male")) |>
+  mutate(overall = score[gender == "Male"]) |>
+  ungroup() |>
+  mutate(label = fct_reorder(label, overall))
+
+corpus_mean <- weighted.mean(cells_sub$score, cells_sub$n_dict)
+
+p_tone <- ggplot(topic_tone, aes(x = score, y = label)) +
+  geom_vline(xintercept = corpus_mean, color = "grey70", linewidth = 0.5) +
+  geom_line(aes(group = label), color = "grey80", linewidth = 1.1) +
+  geom_point(aes(color = gender), size = 2.6) +
+  scale_color_manual(values = pal_gender, name = "Governor",
+                     labels = c(Male = "Men", Female = "Women")) +
+  labs(
+    title    = "Same topic, different language?",
+    subtitle = "Average gendered-language score of passages on each topic, by governor gender",
+    x = "Gendered language score\n<-- more masculine-coded  |  more feminine-coded -->",
+    y = NULL,
+    caption  = sprintf("Substantive topics with at least %d speech-topic cells from women. Gray line = average across substantive topics.\nRaw averages; see the within-topic gap figure for estimates holding party and decade constant.",
+                       min_female_cells)
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+p_tone
+
+save_fig(p_tone, "ch2_fig06_topic_tone_by_gender", height = 7.5)
+```
+
+## Within-topic gender gap (adjusted)
+
+The dumbbell plot above uses raw averages. Here, for each topic: `score ~ female + republican + decade FE`, weighted by dictionary hits, with SEs clustered by governor. This is the within-topic gender gap after accounting for party and era.
+
+```{r within-topic-models}
+min_female_cells <- 15
+
+topic_gaps <- cells_sub |>
+  group_by(topic, label) |>
+  filter(sum(female) >= min_female_cells) |>
+  group_modify(\(d, key) {
+    m  <- lm(score ~ female + republican + factor(decade), data = d, weights = n_dict)
+    ct <- coeftest(m, vcov = vcovCL(m, cluster = ~governor))
+    tibble(estimate = ct["female", 1], std.error = ct["female", 2],
+           n_cells = nrow(d), n_female = sum(d$female))
+  }) |>
+  ungroup() |>
+  mutate(lo = estimate - 1.96 * std.error, hi = estimate + 1.96 * std.error)
+
+topic_gaps |> arrange(desc(estimate))
+```
+
+```{r fig-within-topic-gap, fig.height=7.5}
+# dissertation: Ch. 2 results
+# no gap survives correction 
+p_gap_topic <- topic_gaps |>
+  mutate(
+    sig   = case_when(lo > 0 ~ "Women more feminine-coded",
+                      hi < 0 ~ "Women more masculine-coded",
+                      TRUE   ~ "No clear difference"),
+    sig   = factor(sig, levels = c("Women more feminine-coded", "Women more masculine-coded",
+                                   "No clear difference")),
+    label = fct_reorder(label, estimate)
+  ) |>
+  ggplot(aes(x = estimate, y = label, color = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = lo, xmax = hi), size = 0.35, linewidth = 0.6, show.legend = TRUE) +
+  scale_color_manual(
+    values = c("Women more feminine-coded"  = pal_lang[["Feminine-coded"]],
+               "Women more masculine-coded" = pal_lang[["Masculine-coded"]],
+               "No clear difference"        = "#B5B5B5"),
+    name = NULL, drop = FALSE
+  ) +
+  guides(color = guide_legend(nrow = 2)) +   # keep all three keys inside the figure
+  labs(
+    title    = "Do women governors talk about the same topic differently?",
+    subtitle = "Female - male gap in gendered language within each topic (party and decade held constant)",
+    x = "Female - male gap\n<-- women more masculine-coded  |  women more feminine-coded -->",
+    y = NULL,
+    caption  = sprintf("Substantive topics with at least %d speech-topic cells from women. Weighted by dictionary hits; 95%% CIs clustered by governor.",
+                       min_female_cells)
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+p_gap_topic
+
+save_fig(p_gap_topic, "ch2_fig07_within_topic_gap", height = 7.5)
+```
+
+### Adjusting for multiple comparisons
+
+Twelve topics are tested, so a few "significant" gaps could appear by chance. The Benjamini-Hochberg adjustment controls the share of false discoveries among the significant results.
+
+```{r within-topic-bh}
+# dissertation: Ch. 2 appendix
+topic_gaps <- topic_gaps |>
+  mutate(p    = 2 * pnorm(-abs(estimate / std.error)),
+         p_bh = p.adjust(p, method = "BH"))
+
+topic_gaps |>
+  select(label, estimate, lo, hi, p, p_bh) |>
+  arrange(p) |>
+  mutate(across(c(estimate, lo, hi), \(x) round(x, 3)),
+         across(c(p, p_bh), \(x) round(x, 3)))
+```
+
+## Pooled: composition vs. style
+
+This addresses the central question directly: **is the gender gap about *what* women talk about (topic composition) or *how* they talk (style within topic)?**
+
+* Model A: speech × topic cells, gender and party only, with year and state FE.
+* Model B: adds **topic fixed effects**, so women are compared only with men talking about the same topic.
+
+If the `female` coefficient shrinks from A to B, part of the gap is topic choice. Whatever remains in B is a within-topic difference in style.
+
+```{r composition-vs-style}
+# dissertation: Ch. 2 results
+# about 60% from topic composition
+mA <- lm(score ~ female * republican + factor(year) + state,
+         data = cells_sub, weights = n_dict)
+mB <- lm(score ~ female * republican + factor(topic) + factor(year) + state,
+         data = cells_sub, weights = n_dict)
+
+modelsummary(
+  list("A: no topic FE" = mA, "B: topic FE" = mB),
+  vcov     = ~governor,
+  coef_map = c(female = "Female governor", republican = "Republican",
+               `female:republican` = "Female x Republican"),
+  gof_map  = c("nobs", "r.squared"),
+  stars    = TRUE,
+  notes    = "Unit: speech-by-topic, substantive topics only. Weighted by dictionary hits. Year and state FE in both; SEs clustered by governor."
+)
+```
+
+### What makes women's fiscal language more feminine-coded?
+
+Within the Budget & appropriations and Taxes passages (1975 onward, when nearly all women governors served), which dictionary words push women's language in the feminine direction? A word's **contribution** = (women's rate - men's rate, per 10,000 words) x the word's gender score. It's positive when women use a feminine-coded word more *or* a masculine-coded word less.
+
+```{r fiscal-words, fig.height=6}
+# dissertation: Ch. 2 appendix
+# exploratory
+fiscal_topics <- c(36, 41)   # Budget & appropriations, Taxes & property tax relief
+
+fiscal_passages <- passage_theta |>
+  filter(topic %in% fiscal_topics, topic_share >= min_topic_share) |>
+  inner_join(select(passages, passage_id, id), by = "passage_id") |>
+  inner_join(select(speeches, id, year, gender), by = "id") |>
+  filter(year >= 1975)
+
+count(fiscal_passages, gender, name = "passages")
+
+fiscal_words <- passage_tokens |>
+  inner_join(select(fiscal_passages, passage_id, gender), by = "passage_id") |>
+  group_by(gender) |>
+  mutate(total = n()) |>
+  ungroup() |>
+  inner_join(ru_dic, by = "word") |>
+  count(gender, word, fem_score, total) |>
+  mutate(rate = n / total * 1e4) |>
+  select(gender, word, fem_score, rate) |>
+  pivot_wider(names_from = gender, values_from = rate, values_fill = 0) |>
+  mutate(diff = Female - Male,
+         contribution = diff * fem_score)
+
+fiscal_plot <- bind_rows(
+  slice_max(fiscal_words, contribution, n = 10),
+  slice_min(fiscal_words, contribution, n = 5)
+) |>
+  mutate(direction = if_else(fem_score > 0, "Feminine-coded", "Masculine-coded"),
+         use       = if_else(diff > 0, "women use more", "women use less"),
+         word_lab  = paste0(word, " (", use, ")"),
+         word_lab  = fct_reorder(word_lab, contribution))
+
+p_fiscal <- ggplot(fiscal_plot, aes(x = contribution, y = word_lab, fill = direction)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.4) +
+  scale_fill_manual(values = pal_lang, name = "Word is") +
+  labs(
+    title    = "Which words make women's fiscal language more feminine-coded?",
+    subtitle = "Budget and tax passages, 1975 onward",
+    x = "Contribution to the female - male gap\n<-- pushes women more masculine  |  pushes women more feminine -->",
+    y = NULL,
+    caption  = "Contribution = (women's rate - men's rate per 10,000 words) x word's gender score."
+  ) +
+  theme(panel.grid.major.y = element_blank())
+
+p_fiscal
+save_fig(p_fiscal, "ch2_fig09_fiscal_words", height = 6)
+```
+
+“modest” in context, this prints a few passages where women used it:
+
+```{r}
+passage_tokens |>
+  inner_join(filter(fiscal_passages, gender == "Female") |> select(passage_id), by = "passage_id") |>
+  filter(word == "modest") |>
+  distinct(passage_id) |>
+  slice_head(n = 3) |>
+  inner_join(passages, by = "passage_id") |>
+  pull(text)
+```
+
+## Spotlight: a single topic by gender and party
+
+A speech-level scatter plot for a single topic, written as one function so that any topic can be shown the same way. By default it shows the most masculine- and most feminine-coded topics from the tone plot; pass any topic number.
+
+```{r spotlight-function}
+plot_topic_spotlight <- function(k) {
+  col <- sprintf("topic_%02d", k)
+  d <- speeches_topics |> mutate(x = .data[[col]])
+  x_max <- quantile(d$x, 0.99)
+
+  ggplot(d, aes(x = x, y = fem_score, color = party, fill = party)) +
+    zero_line +
+    geom_point(alpha = 0.25, size = 1) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.15, linewidth = 0.9) +
+    facet_wrap(~gender, labeller = as_labeller(c(Male = "Men governors", Female = "Women governors"))) +
+    scale_color_manual(values = pal_party, name = NULL) +
+    scale_fill_manual(values = pal_party, name = NULL) +
+    scale_x_continuous(labels = label_percent()) +
+    coord_cartesian(xlim = c(0, x_max), ylim = y_zoom) +
+    labs(
+      title    = topic_labels[k],
+      subtitle = "Speech-level gendered language vs. share of the speech devoted to this topic",
+      x = "Share of speech on this topic", y = "Gendered language score\n(< 0 masculine, > 0 feminine)",
+      caption  = "Each point is one speech; lines are OLS fits with 95% CIs. x-axis trimmed at the 99th percentile."
+    ) +
+    theme(panel.spacing = unit(1.5, "lines"))
+}
+```
+
+```{r fig-spotlight, fig.height=5}
+# dissertation: Ch. 2 appendix
+tone_rank <- topic_tone |> distinct(topic, overall) |> arrange(overall)
+spotlight_topics <- c(most_masculine = first(tone_rank$topic),
+                      most_feminine  = last(tone_rank$topic))
+# any topics can be shown, e.g. spotlight_topics <- c(jobs = 12, children = 4)
+
+for (nm in names(spotlight_topics)) {
+  p <- plot_topic_spotlight(spotlight_topics[[nm]])
+  print(p)
+  save_fig(p, paste0("ch2_fig08_spotlight_", nm))
+}
+```
+
+### Optional: most masculine vs. most feminine topic, men and women together
+
+```{r fig-spotlight-masc-fem, fig.height=5, fig.width=10}
+# compute the topic ranking here if the fig-topic-rank chunk hasn't been run
+if (!exists("topic_rank")) {
+  m_rank <- lm(score ~ 0 + factor(topic), data = cells_sub, weights = n_dict)
+  topic_rank <- tibble(
+    topic    = as.integer(str_remove(names(coef(m_rank)), "factor\\(topic\\)")),
+    estimate = coef(m_rank)
+  )
+}
+
+masc_k <- topic_rank$topic[which.min(topic_rank$estimate)]
+fem_k  <- topic_rank$topic[which.max(topic_rank$estimate)]
+# or set by hand, e.g. masc_k <- 18; fem_k <- 19
+
+panel_labels <- c(paste("Most masculine-coded:", topic_info$label[masc_k]),
+                  paste("Most feminine-coded:",  topic_info$label[fem_k]))
+
+d_spot <- speeches_topics |>
+  select(id, gender, fem_score, all_of(sprintf("topic_%02d", c(masc_k, fem_k)))) |>
+  pivot_longer(starts_with("topic_"), names_to = "topic", values_to = "share") |>
+  mutate(topic = as.integer(str_remove(topic, "topic_")),
+         panel = factor(if_else(topic == masc_k, panel_labels[1], panel_labels[2]),
+                        levels = panel_labels)) |>
+  group_by(panel) |>
+  filter(share <= quantile(share, 0.99)) |>      # trim the top 1% of shares for readability
+  ungroup()
+
+p_spot <- ggplot(d_spot, aes(x = share, y = fem_score, color = gender, fill = gender)) +
+  geom_point(data = filter(d_spot, gender == "Male"),   alpha = 0.12, size = 0.8) +
+  geom_point(data = filter(d_spot, gender == "Female"), alpha = 0.6,  size = 1.4) +
+  geom_smooth(method = "lm", alpha = 0.15, linewidth = 1) +
+  facet_wrap(~panel, scales = "free_x") +
+  scale_color_manual(values = pal_gender, labels = c(Male = "Men", Female = "Women"), name = "Governor") +
+  scale_fill_manual(values = pal_gender,  labels = c(Male = "Men", Female = "Women"), name = "Governor") +
+  scale_x_continuous(labels = label_percent(accuracy = 0.1)) +
+  coord_cartesian(ylim = y_zoom) +
+  labs(
+    title    = "Women and men move together on the most gendered topics",
+    subtitle = "Speech-level gendered language vs. share of the speech devoted to the topic",
+    x = "Share of speech on this topic",
+    y = "Gendered language score\n(< 0 masculine, > 0 feminine)",
+    caption  = "Each point is one speech; lines are OLS fits with 95% intervals. Top 1% of topic shares omitted for readability."
+  ) +
+  theme(panel.spacing = unit(2, "lines"))
+
+p_spot
+
+save_fig(p_spot, "ch2_extra_spotlight_masc_fem", width = 10, height = 5)
+```
+
+# Notes on interpretation
+
+* **The overall masculine lean is partly mechanical.** Political vocabulary (*government*, *business*, *work*, *industry*) sits on the masculine side of the R&U scale, so a negative average is expected for any political speech. The informative quantities are *differences*: between speakers, between topics, and within topics.
+* **Coverage.** About 5% of tokens are dictionary words. The `fem_score_nocommon` and `fem_share` measures are robustness checks against a few common words driving the results.
+* **One topic model for both chapters.** "What" (Ch. 1, `estimateEffect`) and "how" (Ch. 2, within-topic gaps) refer to the same 50 topics.
+
+```{r session-info}
+sessionInfo()
+```
+
