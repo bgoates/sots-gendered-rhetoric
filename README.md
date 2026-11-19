@@ -60,10 +60,6 @@ Last run with R 4.3.3, stm 1.3.10, tidytext 0.4.1, ggplot2 3.4.4, modelsummary 1
 - Butler, Daniel M., and Joseph L. Sutherland. 2023. "Have State Policy Agendas Become More Nationalized?" *Journal of Politics* 85(1): 351–355.
 - Roberts, Damon C., and Stephen M. Utych. 2020. "Linking Gender, Language, and Partisanship: Developing a Database of Masculine and Feminine Words." *Political Research Quarterly* 73(1): 40–50.
 
-## License
-
-Code: MIT (see [`LICENSE`](LICENSE)). The data belong to their original authors and are not included.
-
 ## Contact
 
 Bailey G. Oates · [github.com/bgoates](https://github.com/bgoates)
